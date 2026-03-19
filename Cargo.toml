@@ -1,0 +1,21 @@
+[package]
+name = "shiguredo_fdk_aac"
+version = "2026.0.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Shiguredo Inc."]
+license = "Apache-2.0"
+description = "Rust bindings for FDK AAC encoder and decoder with runtime dynamic loading"
+homepage = "https://github.com/shiguredo/fdk-aac-rs"
+repository = "https://github.com/shiguredo/fdk-aac-rs"
+readme = "README.md"
+build = "build.rs"
+include = ["/src/**", "/build.rs", "/README.md", "/LICENSE"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.72.0"
