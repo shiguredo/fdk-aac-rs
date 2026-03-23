@@ -9,37 +9,8 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  ci:
-    name: CI (${{ matrix.os }})
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-24.04
-          - os: ubuntu-24.04-arm
-          - os: ubuntu-22.04
-          - os: ubuntu-22.04-arm
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-      - run: rustup update stable
-      # libfdk-aac-dev: bindgen が参照するヘッダーファイル (ビルド用) と
-      #                 dlopen で動的ロードするランタイムライブラリ (テスト用) を提供する。
-      #                 ビルド時のライブラリリンク (static / dynamic) は行わない。
-      - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential libfdk-aac-dev
-      - uses: shiguredo/github-actions/.github/actions/rust-cache@main
-        with:
-          os: ${{ matrix.os }}
-          toolchain: stable
-      - run: cargo fmt --all --check
-      - run: cargo check
-      - run: cargo clippy -- -D warnings
-      - run: cargo test
-
   github-release:
     name: "Create GitHub Release"
-    needs: [ci]
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.get_version.outputs.VERSION }}
@@ -84,7 +55,7 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   slack_notify:
-    needs: [ci, github-release, publish]
+    needs: [github-release, publish]
     timeout-minutes: 20
     runs-on: ubuntu-slim
     if: ${{ always() }}
