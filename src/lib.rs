@@ -448,7 +448,9 @@ impl Encoder {
         let mut out_args = MaybeUninit::<sys::AACENC_OutArgs>::zeroed();
         unsafe {
             let mut in_args = in_args.assume_init();
-            in_args.numInSamples = self.pcm_buf.len() as sys::INT;
+            let pcm_len = sys::INT::try_from(self.pcm_buf.len())
+                .map_err(|_| Error::InvalidInput("pcm_buf length exceeds INT range"))?;
+            in_args.numInSamples = pcm_len;
 
             let mut in_buf = in_buf.assume_init();
 
@@ -457,7 +459,7 @@ impl Encoder {
             // 一度変数を経由する
             let mut in_buf_bufs = [self.pcm_buf.as_ptr() as *mut c_void];
             let mut in_buf_buffer_identifiers = [sys::AACENC_BufferIdentifier_IN_AUDIO_DATA as i32];
-            let mut in_buf_buf_sizes = [self.pcm_buf.len() as sys::INT * in_elem_size];
+            let mut in_buf_buf_sizes = [pcm_len * in_elem_size];
             let mut in_buf_buf_el_sizes = [in_elem_size];
 
             in_buf.numBufs = 1;
@@ -472,7 +474,9 @@ impl Encoder {
             let mut out_buf_bufs = [self.encode_buf.as_mut_ptr() as *mut c_void];
             let mut out_buf_buffer_identifiers =
                 [sys::AACENC_BufferIdentifier_OUT_BITSTREAM_DATA as i32];
-            let mut out_buf_buf_sizes = [self.encode_buf.len() as sys::INT];
+            let encode_buf_len = sys::INT::try_from(self.encode_buf.len())
+                .map_err(|_| Error::InvalidInput("encode_buf length exceeds INT range"))?;
+            let mut out_buf_buf_sizes = [encode_buf_len];
             let mut out_buf_buf_el_sizes = [out_elem_size];
 
             out_buf.numBufs = 1;
@@ -653,9 +657,11 @@ impl Decoder {
     /// 1 パケット分のデータをデコードする
     fn decode_packet(&mut self, encoded: &[u8]) -> Result<Option<DecodedFrame>, Error> {
         unsafe {
+            let encoded_len = sys::UINT::try_from(encoded.len())
+                .map_err(|_| Error::InvalidInput("encoded packet length exceeds UINT range"))?;
             let mut buf = [encoded.as_ptr() as *mut u8];
-            let buf_size = [encoded.len() as sys::UINT];
-            let mut bytes_valid = encoded.len() as sys::UINT;
+            let buf_size = [encoded_len];
+            let mut bytes_valid = encoded_len;
 
             let h = self.handle;
 
@@ -708,7 +714,8 @@ impl Decoder {
                 ));
             }
             let frame_size = stream_info.frameSize as usize;
-            let num_channels = stream_info.numChannels as u8;
+            let num_channels = u8::try_from(stream_info.numChannels)
+                .map_err(|_| Error::InvalidInput("numChannels exceeds u8 range"))?;
             let sample_rate = stream_info.sampleRate as u32;
             let total_samples = frame_size * num_channels as usize;
 
