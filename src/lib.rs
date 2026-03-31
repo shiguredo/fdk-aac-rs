@@ -502,6 +502,13 @@ impl Encoder {
                     "aacEncEncode returned numOutBytes exceeding output buffer length",
                 ));
             }
+
+            // エンコーダーが入力を消費したが出力がない場合は内部バッファリング中。
+            // エンコード済みデータがある場合のみフレームを返す。
+            if out_bytes == 0 {
+                return Ok(None);
+            }
+
             let data = self.encode_buf[..out_bytes].to_vec();
             Ok(Some(EncodedFrame {
                 data,
