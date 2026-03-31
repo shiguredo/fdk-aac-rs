@@ -18,4 +18,4 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 
 [build-dependencies]
-bindgen = "0.72.0"
+bindgen = "0.72"
