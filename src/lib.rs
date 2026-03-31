@@ -413,11 +413,15 @@ impl Encoder {
     pub fn finish(&mut self) -> Result<(), Error> {
         self.eos = true;
         // pcm_buf が空になるまでエンコードを繰り返す。
-        // encode_impl() が None を返しても pcm_buf にデータが残っている場合は
-        // エンコーダーが内部バッファリング中なので再度呼び出す。
+        // encode_impl() が None を返した場合はエンコーダーがこれ以上進めないため、
+        // 残りのデータを破棄してループを抜ける。
         while !self.pcm_buf.is_empty() {
-            if let Some(frame) = self.encode_impl()? {
-                self.encoded_frames.push_back(frame);
+            match self.encode_impl()? {
+                Some(frame) => self.encoded_frames.push_back(frame),
+                None => {
+                    self.pcm_buf.clear();
+                    break;
+                }
             }
         }
         Ok(())
