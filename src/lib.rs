@@ -923,4 +923,82 @@ mod tests {
             "decoded output is too quiet (RMS: {rms}), expected audible signal"
         );
     }
+
+    /// エンコード → デコードの SNR（Signal-to-Noise Ratio）を検証するテスト。
+    /// 映像の PSNR に相当する音声品質指標。
+    /// AAC-LC 128kbps / 48kHz のラウンドトリップで SNR 30dB 以上を期待する。
+    #[test]
+    fn roundtrip_snr() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lib = load_library();
+        let mut encoder =
+            Encoder::new(lib.clone(), encoder_config(Some(128_000))).expect("create encoder error");
+
+        // 440Hz の正弦波を 5 秒分生成（ステレオ）
+        let duration_secs = 5;
+        let num_samples = TEST_SAMPLE_RATE as usize * duration_secs;
+        let mut pcm_input = Vec::with_capacity(num_samples * TEST_CHANNELS as usize);
+        for i in 0..num_samples {
+            let t = i as f64 / TEST_SAMPLE_RATE as f64;
+            let sample = (t * 440.0 * 2.0 * std::f64::consts::PI).sin();
+            let value = (sample * i16::MAX as f64) as i16;
+            for _ in 0..TEST_CHANNELS {
+                pcm_input.push(value);
+            }
+        }
+
+        // エンコード
+        encoder.encode(&pcm_input).expect("encode error");
+        encoder.finish().expect("finish error");
+
+        let mut encoded_frames = Vec::new();
+        while let Some(frame) = encoder.next_frame() {
+            encoded_frames.push(frame);
+        }
+
+        // デコード
+        let asc = encoder.audio_specific_config();
+        let mut decoder = Decoder::new(lib, asc).expect("create decoder error");
+
+        for frame in &encoded_frames {
+            decoder.decode(&frame.data).expect("decode error");
+        }
+        decoder.finish().expect("finish error");
+
+        let mut pcm_output: Vec<i16> = Vec::new();
+        while let Some(decoded) = decoder.next_frame().expect("next_frame error") {
+            pcm_output.extend_from_slice(&decoded.data);
+        }
+
+        // 入出力の長さを揃える（短い方に合わせる）
+        let compare_len = pcm_input.len().min(pcm_output.len());
+        let input = &pcm_input[..compare_len];
+        let output = &pcm_output[..compare_len];
+
+        // SNR = 10 * log10(signal_power / noise_power)
+        let signal_power: f64 =
+            input.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / compare_len as f64;
+        let noise_power: f64 = input
+            .iter()
+            .zip(output.iter())
+            .map(|(&s, &d)| {
+                let diff = s as f64 - d as f64;
+                diff * diff
+            })
+            .sum::<f64>()
+            / compare_len as f64;
+
+        assert!(
+            noise_power > 0.0,
+            "noise power is zero (lossless roundtrip is unexpected for AAC)"
+        );
+
+        let snr_db = 10.0 * (signal_power / noise_power).log10();
+
+        // AAC-LC 128kbps で SNR 30dB 以上を期待
+        assert!(
+            snr_db > 30.0,
+            "SNR {snr_db:.1} dB is below the 30 dB threshold"
+        );
+    }
 }
