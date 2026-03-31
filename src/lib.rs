@@ -459,7 +459,10 @@ impl Encoder {
             // 一度変数を経由する
             let mut in_buf_bufs = [self.pcm_buf.as_ptr() as *mut c_void];
             let mut in_buf_buffer_identifiers = [sys::AACENC_BufferIdentifier_IN_AUDIO_DATA as i32];
-            let mut in_buf_buf_sizes = [pcm_len * in_elem_size];
+            let in_buf_byte_size = pcm_len
+                .checked_mul(in_elem_size)
+                .ok_or(Error::InvalidInput("pcm_buf byte size overflows INT range"))?;
+            let mut in_buf_buf_sizes = [in_buf_byte_size];
             let mut in_buf_buf_el_sizes = [in_elem_size];
 
             in_buf.numBufs = 1;
@@ -611,7 +614,10 @@ impl Decoder {
         unsafe {
             let h = decoder.handle;
             let mut conf = [audio_specific_config.as_ptr() as *mut u8];
-            let length = [audio_specific_config.len() as sys::UINT];
+            let asc_len = sys::UINT::try_from(audio_specific_config.len()).map_err(|_| {
+                Error::InvalidInput("audio_specific_config length exceeds UINT range")
+            })?;
+            let length = [asc_len];
 
             let code = decoder
                 .lib
