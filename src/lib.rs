@@ -74,6 +74,9 @@ pub enum Error {
         /// エラーが発生した関数名
         function: &'static str,
     },
+
+    /// 不正な入力または FFI 境界値の異常
+    InvalidInput(&'static str),
 }
 
 impl Error {
@@ -106,6 +109,9 @@ impl std::fmt::Display for Error {
                     function,
                     code
                 )
+            }
+            Error::InvalidInput(msg) => {
+                write!(f, "[{}] invalid input: {}", env!("CARGO_PKG_NAME"), msg)
             }
         }
     }
@@ -363,7 +369,13 @@ impl Encoder {
             Error::check_encoder(code, "aacEncInfo")?;
 
             let info = info.assume_init();
-            encoder.audio_specific_config = info.confBuf[..info.confSize as usize].to_vec();
+            let conf_size = info.confSize as usize;
+            if conf_size > info.confBuf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncInfo returned confSize exceeding confBuf length",
+                ));
+            }
+            encoder.audio_specific_config = info.confBuf[..conf_size].to_vec();
             encoder.frame_len = info.frameLength as usize;
         }
 
@@ -472,6 +484,11 @@ impl Encoder {
 
             let out_args = out_args.assume_init();
             let consumed = out_args.numInSamples as usize;
+            if consumed > self.pcm_buf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncEncode returned numInSamples exceeding input buffer length",
+                ));
+            }
             self.pcm_buf.drain(..consumed);
 
             // consumed == 0 かつ出力もない場合はこれ以上進まない
@@ -479,7 +496,13 @@ impl Encoder {
                 return Ok(None);
             }
 
-            let data = self.encode_buf[..out_args.numOutBytes as usize].to_vec();
+            let out_bytes = out_args.numOutBytes as usize;
+            if out_bytes > self.encode_buf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncEncode returned numOutBytes exceeding output buffer length",
+                ));
+            }
+            let data = self.encode_buf[..out_bytes].to_vec();
             Ok(Some(EncodedFrame {
                 data,
                 samples: consumed / channels,
@@ -586,8 +609,12 @@ impl Decoder {
     /// AAC 圧縮データをデコーダーに入力する
     ///
     /// 1 回の呼び出しで 1 パケット分のデータを渡す。
+    /// 空のデータを渡すとエラーを返す。
     /// デコード結果は [`Decoder::next_frame()`] で取得できる。
     pub fn decode(&mut self, encoded: &[u8]) -> Result<(), Error> {
+        if encoded.is_empty() {
+            return Err(Error::InvalidInput("encoded data must not be empty"));
+        }
         self.encoded_packets.push_back(encoded.to_vec());
         Ok(())
     }
@@ -662,6 +689,15 @@ impl Decoder {
             let num_channels = stream_info.numChannels as u8;
             let sample_rate = stream_info.sampleRate as u32;
             let total_samples = frame_size * num_channels as usize;
+
+            // デコード結果がバッファサイズを超える場合はエラーにする。
+            // Decoder は audio_specific_config 経由で任意チャンネル数を受け取りうるため、
+            // C API が返した値がバッファ範囲内であることを検証する必要がある。
+            if total_samples > DECODE_BUF_SIZE {
+                return Err(Error::InvalidInput(
+                    "aacDecoder_DecodeFrame output exceeds decode buffer size",
+                ));
+            }
 
             // バッファを実際のサンプル数に縮小
             decode_buf.truncate(total_samples);
