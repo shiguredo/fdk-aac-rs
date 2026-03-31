@@ -376,6 +376,9 @@ impl Encoder {
                 ));
             }
             encoder.audio_specific_config = info.confBuf[..conf_size].to_vec();
+            if info.frameLength == 0 {
+                return Err(Error::InvalidInput("aacEncInfo returned frameLength of 0"));
+            }
             encoder.frame_len = info.frameLength as usize;
         }
 
@@ -692,6 +695,14 @@ impl Decoder {
             }
 
             let stream_info = &*stream_info;
+            if stream_info.frameSize <= 0
+                || stream_info.numChannels <= 0
+                || stream_info.sampleRate <= 0
+            {
+                return Err(Error::InvalidInput(
+                    "aacDecoder_GetStreamInfo returned invalid stream parameters",
+                ));
+            }
             let frame_size = stream_info.frameSize as usize;
             let num_channels = stream_info.numChannels as u8;
             let sample_rate = stream_info.sampleRate as u32;
