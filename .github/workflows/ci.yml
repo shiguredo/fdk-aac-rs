@@ -31,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: rustup update stable
       # libfdk-aac-dev: bindgen が参照するヘッダーファイル (ビルド用) と
       #                 dlopen で動的ロードするランタイムライブラリ (テスト用) を提供する。
@@ -54,7 +54,7 @@ jobs:
     env:
       DOCS_RS: 1
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: rustup update stable
       - run: cargo doc --no-deps
 
