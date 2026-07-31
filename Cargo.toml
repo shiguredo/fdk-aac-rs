@@ -10,7 +10,7 @@ homepage = "https://github.com/shiguredo/fdk-aac-rs"
 repository = "https://github.com/shiguredo/fdk-aac-rs"
 readme = "README.md"
 build = "build.rs"
-include = ["/src/**", "/build.rs", "/README.md", "/LICENSE"]
+include = ["/LICENSE", "/README.md", "/build.rs", "/src/**"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
