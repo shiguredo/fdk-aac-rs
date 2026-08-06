@@ -1,0 +1,13 @@
+[package]
+name = "pbt"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[dependencies]
+# Property-Based Testing
+proptest = "1.11"
+
+# PBT 対象の FDK AAC バインディング
+shiguredo_fdk_aac = { path = "../" }

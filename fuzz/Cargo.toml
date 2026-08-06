@@ -1,0 +1,31 @@
+[package]
+name = "shiguredo_fdk_aac-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_fdk_aac_roundtrip"
+path = "fuzz_targets/fuzz_fdk_aac_roundtrip.rs"
+test = false
+
+[[bin]]
+bench = false
+doc = false
+name = "fuzz_fdk_aac_decoder"
+path = "fuzz_targets/fuzz_fdk_aac_decoder.rs"
+test = false
+
+[dependencies]
+# libFuzzer 連携
+libfuzzer-sys = "0.4"
+
+# Fuzzing 対象の FDK AAC バインディング
+[dependencies.shiguredo_fdk_aac]
+path = ".."

@@ -2,7 +2,7 @@
 name = "shiguredo_fdk_aac"
 version = "2026.1.0-canary.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.93"
 authors = ["Shiguredo Inc."]
 license = "Apache-2.0"
 description = "Rust bindings for FDK AAC encoder and decoder with runtime dynamic loading"
@@ -15,7 +15,14 @@ include = ["/LICENSE", "/README.md", "/build.rs", "/src/**"]
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 
+# PBT (Property-Based Testing) 用のワークスペースメンバー
+# fuzz は cargo-fuzz 用の独立クレートなのでワークスペースから除外する
+[workspace]
+members = ["pbt"]
+exclude = ["fuzz"]
+
 [dependencies]
 
 [build-dependencies]
+# FDK AAC の C ヘッダーから FFI バインディングを生成するために使用する
 bindgen = "0.72"

@@ -8,7 +8,7 @@ fail_fast = true
 default_stages = ["pre-commit"]
 # prek install で pre-commit と pre-push の両方の Git フックを入れる
 default_install_hook_types = ["pre-commit", "pre-push"]
-exclude = { glob = ["target/**"] }
+exclude = { glob = ["target/**", "fuzz/target/**"] }
 
 # prek 組み込みフック (オフラインで動作する Rust ネイティブ実装)
 [[repos]]
