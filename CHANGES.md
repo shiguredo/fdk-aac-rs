@@ -44,15 +44,6 @@
 - [ADD] Ubuntu 26.04 (x86_64 / arm64) 対応を追加する
   - @voluntas
 
-
-### misc
-
-- テスト構成を shiguredo-rust 規約に合わせて整理する
-  - 単体テストを `tests/test_lib.rs` に移動する
-  - PBT を `pbt/tests/prop_lib.rs` として追加する
-  - Fuzzing ターゲットを `fuzz/` に追加する
-  - @voluntas
-
 ## 2025.1.1
 
 **リリース日**: 2025-11-27
