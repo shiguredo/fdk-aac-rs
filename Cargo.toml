@@ -3,12 +3,11 @@ name = "shiguredo_fdk_aac"
 version = "2026.1.0-canary.2"
 edition = "2024"
 rust-version = "1.93"
-authors = ["Shiguredo Inc."]
-license = "Apache-2.0"
 description = "Rust bindings for FDK AAC encoder and decoder with runtime dynamic loading"
+readme = "README.md"
 homepage = "https://github.com/shiguredo/fdk-aac-rs"
 repository = "https://github.com/shiguredo/fdk-aac-rs"
-readme = "README.md"
+license = "Apache-2.0"
 build = "build.rs"
 include = ["/LICENSE", "/README.md", "/build.rs", "/src/**"]
 
