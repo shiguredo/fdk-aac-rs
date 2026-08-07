@@ -1,0 +1,788 @@
+//! [FDK AAC] エンコーダー / デコーダー
+//!
+//! [FDK AAC] ライブラリを実行時に動的ロードして、PCM 音声データの AAC エンコード / デコードを行う。
+//! ビルド時のライブラリリンクは不要で、実行時に共有ライブラリのパスを指定してロードする。
+//!
+//! [FDK AAC]: https://github.com/mstorsjo/fdk-aac
+#![warn(missing_docs)]
+
+// Linux 以外ではビルドを許可しない (cargo doc 時は除外)
+#[cfg(all(not(target_os = "linux"), not(doc)))]
+compile_error!("this crate only supports Linux");
+
+use std::{
+    collections::VecDeque,
+    ffi::c_void,
+    mem::MaybeUninit,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+mod dl;
+mod sys;
+
+// FDK AAC エンコーダー関数の型定義
+type FnAacEncOpen =
+    unsafe extern "C" fn(*mut sys::HANDLE_AACENCODER, sys::UINT, sys::UINT) -> sys::AACENC_ERROR;
+type FnAacEncClose = unsafe extern "C" fn(*mut sys::HANDLE_AACENCODER) -> sys::AACENC_ERROR;
+type FnAacEncoderSetParam =
+    unsafe extern "C" fn(sys::HANDLE_AACENCODER, sys::AACENC_PARAM, sys::UINT) -> sys::AACENC_ERROR;
+type FnAacEncEncode = unsafe extern "C" fn(
+    sys::HANDLE_AACENCODER,
+    *const sys::AACENC_BufDesc,
+    *const sys::AACENC_BufDesc,
+    *const sys::AACENC_InArgs,
+    *mut sys::AACENC_OutArgs,
+) -> sys::AACENC_ERROR;
+type FnAacEncInfo =
+    unsafe extern "C" fn(sys::HANDLE_AACENCODER, *mut sys::AACENC_InfoStruct) -> sys::AACENC_ERROR;
+
+// FDK AAC デコーダー関数の型定義
+type FnAacDecoderOpen =
+    unsafe extern "C" fn(sys::TRANSPORT_TYPE, sys::UINT) -> sys::HANDLE_AACDECODER;
+type FnAacDecoderClose = unsafe extern "C" fn(sys::HANDLE_AACDECODER);
+type FnAacDecoderConfigRaw = unsafe extern "C" fn(
+    sys::HANDLE_AACDECODER,
+    *mut *mut u8,
+    *const sys::UINT,
+) -> sys::AAC_DECODER_ERROR;
+type FnAacDecoderFill = unsafe extern "C" fn(
+    sys::HANDLE_AACDECODER,
+    *mut *mut u8,
+    *const sys::UINT,
+    *mut sys::UINT,
+) -> sys::AAC_DECODER_ERROR;
+type FnAacDecoderDecodeFrame = unsafe extern "C" fn(
+    sys::HANDLE_AACDECODER,
+    *mut i16,
+    sys::INT,
+    sys::UINT,
+) -> sys::AAC_DECODER_ERROR;
+type FnAacDecoderGetStreamInfo =
+    unsafe extern "C" fn(sys::HANDLE_AACDECODER) -> *mut sys::CStreamInfo;
+
+/// FDK AAC API のエラー
+#[derive(Debug)]
+pub enum Error {
+    /// 共有ライブラリのロードまたはシンボル解決に失敗
+    SharedLibraryError(String),
+
+    /// FDK AAC エンコーダー / デコーダーのエラー
+    FdkAacError {
+        /// エラーコード
+        code: std::os::raw::c_uint,
+        /// エラーが発生した関数名
+        function: &'static str,
+    },
+
+    /// 不正な入力または FFI 境界値の異常
+    InvalidInput(&'static str),
+}
+
+impl Error {
+    fn check_encoder(code: sys::AACENC_ERROR, function: &'static str) -> Result<(), Self> {
+        if code == sys::AACENC_ERROR_AACENC_OK {
+            return Ok(());
+        }
+        Err(Self::FdkAacError { code, function })
+    }
+
+    fn check_decoder(code: sys::AAC_DECODER_ERROR, function: &'static str) -> Result<(), Self> {
+        if code == sys::AAC_DECODER_ERROR_AAC_DEC_OK {
+            return Ok(());
+        }
+        Err(Self::FdkAacError { code, function })
+    }
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::SharedLibraryError(msg) => {
+                write!(f, "[{}] {}", env!("CARGO_PKG_NAME"), msg)
+            }
+            Error::FdkAacError { code, function } => {
+                write!(
+                    f,
+                    "[{}] {}() failed: code={}",
+                    env!("CARGO_PKG_NAME"),
+                    function,
+                    code
+                )
+            }
+            Error::InvalidInput(msg) => {
+                write!(f, "[{}] invalid input: {}", env!("CARGO_PKG_NAME"), msg)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+// エンコード結果を格納するための一時バッファのサイズ（バイト数）
+//
+// AAC-LC の 1 フレーム最大出力は 6144 bits/channel * 2 channels / 8 = 1536 bytes 程度。
+// 20480 bytes は十分なマージンを持たせた値。
+const ENCODE_BUF_SIZE: usize = 20480;
+
+// デコード時の出力バッファサイズ（サンプル数）
+const DECODE_BUF_SIZE: usize = 4096;
+
+/// FDK AAC 共有ライブラリを管理するための構造体
+///
+/// 実行時に `libfdk-aac.so` を動的ロードし、エンコーダー / デコーダーの生成に使用する。
+#[derive(Debug, Clone)]
+pub struct FdkAacLibrary {
+    lib: Arc<dl::DynLib>,
+    path: PathBuf,
+}
+
+impl FdkAacLibrary {
+    /// 指定のパスにある共有ライブラリをロードする
+    ///
+    /// ライブラリ名のみ（例: `"libfdk-aac.so.2"`）を指定した場合、
+    /// システムのライブラリ検索パスから自動的に探索される。
+    pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        let lib = dl::DynLib::open(path.as_ref()).map_err(Error::SharedLibraryError)?;
+        Ok(Self {
+            lib: Arc::new(lib),
+            path: path.as_ref().to_path_buf(),
+        })
+    }
+
+    /// 共有ライブラリのパスを取得する
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn call<F, T, U>(&self, symbol: &str, f: F) -> Result<U, Error>
+    where
+        F: FnOnce(T) -> U,
+    {
+        let func: T = unsafe {
+            self.lib
+                .get(symbol.as_bytes())
+                .map_err(Error::SharedLibraryError)?
+        };
+        Ok(f(func))
+    }
+}
+
+/// エンコーダーの設定
+///
+/// FDK AAC エンコーダーに必要な全パラメーターを保持する。
+/// `Option` のフィールドは未指定時にエンコーダーのデフォルト値が使用される。
+#[derive(Debug, Clone)]
+pub struct EncoderConfig {
+    /// 入力 PCM のサンプルレート (Hz)
+    ///
+    /// 0 を指定するとエラーが返る。
+    pub sample_rate: u32,
+
+    /// 入力 PCM のチャンネル数
+    ///
+    /// 1（モノラル）または 2（ステレオ）を指定する。
+    /// 0 や 3 以上を指定するとエラーが返る。
+    pub channels: u8,
+
+    /// ターゲットビットレート (bps)
+    ///
+    /// 未指定時はエンコーダーのデフォルト値が使用される。
+    pub bitrate: Option<u32>,
+}
+
+/// AAC エンコーダー
+///
+/// FDK AAC ライブラリを使用して PCM 音声データを AAC にエンコードする。
+///
+/// # 使用フロー
+///
+/// 1. [`Encoder::new()`] でインスタンスを生成する
+/// 2. [`Encoder::encode()`] で PCM データを入力する（複数回呼び出し可能）
+/// 3. [`Encoder::next_frame()`] でエンコード済みフレームを取り出す
+/// 4. 全データの入力が完了したら [`Encoder::finish()`] を呼び出す
+/// 5. 残りのフレームを [`Encoder::next_frame()`] で取り出す
+#[derive(Debug)]
+pub struct Encoder {
+    /// 共有ライブラリ（Drop で使用）
+    lib: FdkAacLibrary,
+    /// エンコーダーハンドル
+    handle: sys::HANDLE_AACENCODER,
+    /// エンコーダーに設定されたチャンネル数
+    channels: usize,
+    /// エンコード結果を格納するための一時バッファ
+    encode_buf: Vec<u8>,
+    /// まだエンコードされていない PCM サンプルのバッファ（インターリーブ形式）
+    pcm_buf: Vec<i16>,
+    /// エンコード済みフレームのキュー（next_frame() で取り出される）
+    encoded_frames: VecDeque<EncodedFrame>,
+    /// Audio Specific Config
+    audio_specific_config: Vec<u8>,
+    /// 1 フレームあたりのサンプル数（チャンネルあたり）
+    frame_len: usize,
+    /// finish() が呼ばれたかどうか
+    eos: bool,
+}
+
+impl Encoder {
+    /// エンコーダーインスタンスを生成する
+    ///
+    /// AAC-LC エンコーダーを作成し、各種パラメーターを設定する。
+    /// Afterburner（品質向上機能）はデフォルトで有効。
+    pub fn new(lib: FdkAacLibrary, config: EncoderConfig) -> Result<Self, Error> {
+        if config.sample_rate == 0 {
+            return Err(Error::FdkAacError {
+                code: sys::AACENC_ERROR_AACENC_INVALID_CONFIG,
+                function: "Encoder::new(sample_rate)",
+            });
+        }
+        if config.channels == 0 {
+            return Err(Error::FdkAacError {
+                code: sys::AACENC_ERROR_AACENC_INVALID_CONFIG,
+                function: "Encoder::new(channels)",
+            });
+        }
+
+        let channels = config.channels as usize;
+
+        // チャンネルモード: ステレオの場合は MODE_2、モノラルの場合は MODE_1
+        let channel_mode = match config.channels {
+            1 => sys::CHANNEL_MODE_MODE_1,
+            2 => sys::CHANNEL_MODE_MODE_2,
+            _ => {
+                return Err(Error::FdkAacError {
+                    code: sys::AACENC_ERROR_AACENC_INVALID_CONFIG,
+                    function: "Encoder::new(channels)",
+                });
+            }
+        };
+
+        let mut handle = std::ptr::null_mut();
+
+        // aacEncOpen でハンドルを取得する
+        let code = lib.call("aacEncOpen", |f: FnAacEncOpen| unsafe {
+            f(&mut handle, 0, channels as sys::UINT)
+        })?;
+        Error::check_encoder(code, "aacEncOpen")?;
+
+        // ここから先でエラーが発生した場合、Encoder の Drop で aacEncClose が呼ばれる
+        let mut encoder = Self {
+            lib,
+            handle,
+            channels,
+            encode_buf: vec![0; ENCODE_BUF_SIZE],
+            pcm_buf: Vec::new(),
+            encoded_frames: VecDeque::new(),
+            audio_specific_config: Vec::new(),
+            frame_len: 0,
+            eos: false,
+        };
+
+        unsafe {
+            let h = encoder.handle;
+
+            // AAC-LC (Low Complexity) を指定する
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(
+                        h,
+                        sys::AACENC_PARAM_AACENC_AOT,
+                        sys::AUDIO_OBJECT_TYPE_AOT_AAC_LC as sys::UINT,
+                    )
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(AOT)")?;
+
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(
+                        h,
+                        sys::AACENC_PARAM_AACENC_SAMPLERATE,
+                        config.sample_rate as sys::UINT,
+                    )
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(SAMPLERATE)")?;
+
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(
+                        h,
+                        sys::AACENC_PARAM_AACENC_CHANNELMODE,
+                        channel_mode as sys::UINT,
+                    )
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(CHANNELMODE)")?;
+
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(h, sys::AACENC_PARAM_AACENC_CHANNELORDER, 1)
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(CHANNELORDER)")?;
+
+            // ビットレート設定（未指定時はエンコーダーのデフォルト値）
+            if let Some(bitrate) = config.bitrate {
+                let code = encoder
+                    .lib
+                    .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                        f(h, sys::AACENC_PARAM_AACENC_BITRATE, bitrate as sys::UINT)
+                    })?;
+                Error::check_encoder(code, "aacEncoder_SetParam(BITRATE)")?;
+            }
+
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(
+                        h,
+                        sys::AACENC_PARAM_AACENC_TRANSMUX,
+                        sys::TRANSPORT_TYPE_TT_MP4_RAW as sys::UINT,
+                    )
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(TRANSMUX)")?;
+
+            let code = encoder
+                .lib
+                .call("aacEncoder_SetParam", |f: FnAacEncoderSetParam| {
+                    f(h, sys::AACENC_PARAM_AACENC_AFTERBURNER, 1)
+                })?;
+            Error::check_encoder(code, "aacEncoder_SetParam(AFTERBURNER)")?;
+
+            // エンコーダーを初期化する
+            let code = encoder.lib.call("aacEncEncode", |f: FnAacEncEncode| {
+                f(
+                    h,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
+            })?;
+            Error::check_encoder(code, "aacEncEncode")?;
+
+            let mut info = MaybeUninit::<sys::AACENC_InfoStruct>::zeroed();
+            let code = encoder
+                .lib
+                .call("aacEncInfo", |f: FnAacEncInfo| f(h, info.as_mut_ptr()))?;
+            Error::check_encoder(code, "aacEncInfo")?;
+
+            let info = info.assume_init();
+            let conf_size = info.confSize as usize;
+            if conf_size > info.confBuf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncInfo returned confSize exceeding confBuf length",
+                ));
+            }
+            encoder.audio_specific_config = info.confBuf[..conf_size].to_vec();
+            if info.frameLength == 0 {
+                return Err(Error::InvalidInput("aacEncInfo returned frameLength of 0"));
+            }
+            encoder.frame_len = info.frameLength as usize;
+        }
+
+        Ok(encoder)
+    }
+
+    /// MP4 のサンプルエントリーに設定するデコーダー向けの情報
+    pub fn audio_specific_config(&self) -> &[u8] {
+        &self.audio_specific_config
+    }
+
+    /// PCM 音声データをエンコードする
+    ///
+    /// インターリーブ形式の i16 PCM データを受け取り、内部バッファに蓄積する。
+    /// 十分なサンプルが蓄積されるとエンコードを実行する。
+    /// エンコード結果は [`Encoder::next_frame()`] で取得できる。
+    pub fn encode(&mut self, pcm: &[i16]) -> Result<(), Error> {
+        self.pcm_buf.extend_from_slice(pcm);
+        while self.pcm_buf.len() >= self.frame_len * self.channels {
+            match self.encode_impl()? {
+                Some(frame) => self.encoded_frames.push_back(frame),
+                None => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// エンコーダーに、これ以上データが来ないことを伝える
+    ///
+    /// 内部バッファに残っている PCM データをすべてエンコードする。
+    /// 残りのエンコード結果は [`Encoder::next_frame()`] で取得できる。
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.eos = true;
+        // pcm_buf が空になるまでエンコードを繰り返す。
+        // encode_impl() が None を返した場合はエンコーダーがこれ以上進めないため、
+        // 残りのデータを破棄してループを抜ける。
+        while !self.pcm_buf.is_empty() {
+            match self.encode_impl()? {
+                Some(frame) => self.encoded_frames.push_back(frame),
+                None => {
+                    self.pcm_buf.clear();
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// エンコード済みのフレームを取り出す
+    ///
+    /// エンコード結果がない場合は `None` を返す。
+    pub fn next_frame(&mut self) -> Option<EncodedFrame> {
+        self.encoded_frames.pop_front()
+    }
+
+    /// aacEncEncode を呼び出して 1 パケット分のエンコードを試みる
+    fn encode_impl(&mut self) -> Result<Option<EncodedFrame>, Error> {
+        if self.pcm_buf.is_empty() {
+            return Ok(None);
+        }
+
+        let in_buf = MaybeUninit::<sys::AACENC_BufDesc>::zeroed();
+        let out_buf = MaybeUninit::<sys::AACENC_BufDesc>::zeroed();
+        let in_elem_size = 2;
+        let out_elem_size = 1;
+        let in_args = MaybeUninit::<sys::AACENC_InArgs>::zeroed();
+        let mut out_args = MaybeUninit::<sys::AACENC_OutArgs>::zeroed();
+        unsafe {
+            let mut in_args = in_args.assume_init();
+            let pcm_len = sys::INT::try_from(self.pcm_buf.len())
+                .map_err(|_| Error::InvalidInput("pcm_buf length exceeds INT range"))?;
+            in_args.numInSamples = pcm_len;
+
+            let mut in_buf = in_buf.assume_init();
+
+            // 一時配列を直接フィールドに代入してしまうと、
+            // リリースビルド時のコンパイラの最適化によってポインタが無効になることがあるので、
+            // 一度変数を経由する
+            let mut in_buf_bufs = [self.pcm_buf.as_ptr() as *mut c_void];
+            let mut in_buf_buffer_identifiers = [sys::AACENC_BufferIdentifier_IN_AUDIO_DATA as i32];
+            let in_buf_byte_size = pcm_len
+                .checked_mul(in_elem_size)
+                .ok_or(Error::InvalidInput("pcm_buf byte size overflows INT range"))?;
+            let mut in_buf_buf_sizes = [in_buf_byte_size];
+            let mut in_buf_buf_el_sizes = [in_elem_size];
+
+            in_buf.numBufs = 1;
+            in_buf.bufs = in_buf_bufs.as_mut_ptr();
+            in_buf.bufferIdentifiers = in_buf_buffer_identifiers.as_mut_ptr();
+            in_buf.bufSizes = in_buf_buf_sizes.as_mut_ptr();
+            in_buf.bufElSizes = in_buf_buf_el_sizes.as_mut_ptr();
+
+            let mut out_buf = out_buf.assume_init();
+
+            // in_buf_* と同様にこちらも変数を経由してポインタを取得する
+            let mut out_buf_bufs = [self.encode_buf.as_mut_ptr() as *mut c_void];
+            let mut out_buf_buffer_identifiers =
+                [sys::AACENC_BufferIdentifier_OUT_BITSTREAM_DATA as i32];
+            let encode_buf_len = sys::INT::try_from(self.encode_buf.len())
+                .map_err(|_| Error::InvalidInput("encode_buf length exceeds INT range"))?;
+            let mut out_buf_buf_sizes = [encode_buf_len];
+            let mut out_buf_buf_el_sizes = [out_elem_size];
+
+            out_buf.numBufs = 1;
+            out_buf.bufs = out_buf_bufs.as_mut_ptr();
+            out_buf.bufferIdentifiers = out_buf_buffer_identifiers.as_mut_ptr();
+            out_buf.bufSizes = out_buf_buf_sizes.as_mut_ptr();
+            out_buf.bufElSizes = out_buf_buf_el_sizes.as_mut_ptr();
+
+            let h = self.handle;
+            let channels = self.channels;
+            let out_args_ptr = out_args.as_mut_ptr();
+            let code = self.lib.call("aacEncEncode", |f: FnAacEncEncode| {
+                f(h, &in_buf, &out_buf, &in_args, out_args_ptr)
+            })?;
+            Error::check_encoder(code, "aacEncEncode")?;
+
+            let out_args = out_args.assume_init();
+            let consumed = out_args.numInSamples as usize;
+            if consumed > self.pcm_buf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncEncode returned numInSamples exceeding input buffer length",
+                ));
+            }
+            self.pcm_buf.drain(..consumed);
+
+            // consumed == 0 かつ出力もない場合はこれ以上進まない
+            if consumed == 0 && out_args.numOutBytes == 0 {
+                return Ok(None);
+            }
+
+            let out_bytes = out_args.numOutBytes as usize;
+            if out_bytes > self.encode_buf.len() {
+                return Err(Error::InvalidInput(
+                    "aacEncEncode returned numOutBytes exceeding output buffer length",
+                ));
+            }
+
+            // エンコーダーが入力を消費したが出力がない場合は内部バッファリング中。
+            // エンコード済みデータがある場合のみフレームを返す。
+            if out_bytes == 0 {
+                return Ok(None);
+            }
+
+            let data = self.encode_buf[..out_bytes].to_vec();
+            Ok(Some(EncodedFrame {
+                data,
+                samples: consumed / channels,
+            }))
+        }
+    }
+}
+
+impl Drop for Encoder {
+    fn drop(&mut self) {
+        let _ = self.lib.call("aacEncClose", |f: FnAacEncClose| unsafe {
+            f(&mut self.handle)
+        });
+    }
+}
+
+// HANDLE_AACENCODER 自体はスレッドセーフではないが、
+// Encoder は &mut self を要求するため、同時アクセスは Rust の型システムで防がれる。
+// Sync は実装しない: HANDLE_AACENCODER が内部的にスレッドセーフでないため。
+unsafe impl Send for Encoder {}
+
+/// エンコードされた AAC フレーム
+///
+/// 1 回のエンコードで生成される圧縮データとメタデータを保持する。
+#[derive(Debug)]
+pub struct EncodedFrame {
+    /// 圧縮データ
+    pub data: Vec<u8>,
+
+    /// このフレームに含まれている PCM サンプル数（チャンネルあたり）
+    pub samples: usize,
+}
+
+/// AAC デコーダー
+///
+/// FDK AAC ライブラリを使用して AAC 圧縮データを PCM にデコードする。
+///
+/// # 使用フロー
+///
+/// 1. [`Decoder::new()`] でインスタンスを生成する
+/// 2. [`Decoder::decode()`] で圧縮データを入力する（1 パケットずつ）
+/// 3. [`Decoder::next_frame()`] でデコード済みフレームを取り出す
+/// 4. 全データの入力が完了したら [`Decoder::finish()`] を呼び出す
+/// 5. 残りのフレームを [`Decoder::next_frame()`] で取り出す
+#[derive(Debug)]
+pub struct Decoder {
+    /// 共有ライブラリ（Drop で使用）
+    lib: FdkAacLibrary,
+    /// デコーダーハンドル
+    handle: sys::HANDLE_AACDECODER,
+    /// デコード待ちの圧縮パケットのキュー
+    encoded_packets: VecDeque<Vec<u8>>,
+    /// finish() が呼ばれたかどうか
+    eos: bool,
+}
+
+impl Decoder {
+    /// デコーダーインスタンスを生成する
+    ///
+    /// Audio Specific Config バッファを指定して、AAC デコーダーを初期化する。
+    pub fn new(lib: FdkAacLibrary, audio_specific_config: &[u8]) -> Result<Self, Error> {
+        if audio_specific_config.is_empty() {
+            // 空が指定されると SIGSEGV となることがあるのでここで弾く
+            return Err(Error::FdkAacError {
+                code: sys::AAC_DECODER_ERROR_AAC_DEC_UNKNOWN,
+                function: "Decoder::new(audio_specific_config is empty)",
+            });
+        }
+
+        let handle = lib.call("aacDecoder_Open", |f: FnAacDecoderOpen| unsafe {
+            f(sys::TRANSPORT_TYPE_TT_MP4_RAW, 1)
+        })?;
+        if handle.is_null() {
+            return Err(Error::FdkAacError {
+                code: sys::AAC_DECODER_ERROR_AAC_DEC_UNKNOWN,
+                function: "aacDecoder_Open",
+            });
+        }
+
+        // ここから先でエラーが発生した場合、Decoder の Drop で aacDecoder_Close が呼ばれる
+        let decoder = Self {
+            lib,
+            handle,
+            encoded_packets: VecDeque::new(),
+            eos: false,
+        };
+
+        unsafe {
+            let h = decoder.handle;
+            let mut conf = [audio_specific_config.as_ptr() as *mut u8];
+            let asc_len = sys::UINT::try_from(audio_specific_config.len()).map_err(|_| {
+                Error::InvalidInput("audio_specific_config length exceeds UINT range")
+            })?;
+            let length = [asc_len];
+
+            let code = decoder
+                .lib
+                .call("aacDecoder_ConfigRaw", |f: FnAacDecoderConfigRaw| {
+                    f(h, conf.as_mut_ptr(), length.as_ptr())
+                })?;
+            Error::check_decoder(code, "aacDecoder_ConfigRaw")?;
+        }
+
+        Ok(decoder)
+    }
+
+    /// AAC 圧縮データをデコーダーに入力する
+    ///
+    /// 1 回の呼び出しで 1 パケット分のデータを渡す。
+    /// 空のデータを渡すとエラーを返す。
+    /// デコード結果は [`Decoder::next_frame()`] で取得できる。
+    pub fn decode(&mut self, encoded: &[u8]) -> Result<(), Error> {
+        if encoded.is_empty() {
+            return Err(Error::InvalidInput("encoded data must not be empty"));
+        }
+        self.encoded_packets.push_back(encoded.to_vec());
+        Ok(())
+    }
+
+    /// デコーダーに、これ以上データが来ないことを伝える
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.eos = true;
+        Ok(())
+    }
+
+    /// デコード済みのフレームを取り出す
+    ///
+    /// キューにあるパケットを 1 つデコードして返す。
+    /// パケットがない場合は `None` を返す。
+    pub fn next_frame(&mut self) -> Result<Option<DecodedFrame>, Error> {
+        let Some(packet) = self.encoded_packets.pop_front() else {
+            return Ok(None);
+        };
+        self.decode_packet(&packet)
+    }
+
+    /// 1 パケット分のデータをデコードする
+    fn decode_packet(&mut self, encoded: &[u8]) -> Result<Option<DecodedFrame>, Error> {
+        unsafe {
+            let encoded_len = sys::UINT::try_from(encoded.len())
+                .map_err(|_| Error::InvalidInput("encoded packet length exceeds UINT range"))?;
+            let mut buf = [encoded.as_ptr() as *mut u8];
+            let buf_size = [encoded_len];
+            let mut bytes_valid = encoded_len;
+
+            let h = self.handle;
+
+            // デコーダーの入力バッファにデータを充填する
+            let code = self.lib.call("aacDecoder_Fill", |f: FnAacDecoderFill| {
+                f(h, buf.as_mut_ptr(), buf_size.as_ptr(), &mut bytes_valid)
+            })?;
+            Error::check_decoder(code, "aacDecoder_Fill")?;
+
+            // デコード用バッファを準備
+            // aacDecoder_DecodeFrame の timeDataSize は PCM サンプル数を期待する
+            let mut decode_buf = vec![0i16; DECODE_BUF_SIZE];
+            let decode_buf_ptr = decode_buf.as_mut_ptr();
+            let decode_buf_size = decode_buf.len() as sys::INT;
+
+            // フレームをデコードする
+            let code = self
+                .lib
+                .call("aacDecoder_DecodeFrame", |f: FnAacDecoderDecodeFrame| {
+                    f(h, decode_buf_ptr, decode_buf_size, 0)
+                })?;
+
+            // AAC_DEC_NOT_ENOUGH_BITS は入力データ不足を示す
+            if code == sys::AAC_DECODER_ERROR_AAC_DEC_NOT_ENOUGH_BITS {
+                return Ok(None);
+            }
+            if code != sys::AAC_DECODER_ERROR_AAC_DEC_OK {
+                return Err(Error::FdkAacError {
+                    code,
+                    function: "aacDecoder_DecodeFrame",
+                });
+            }
+
+            // ストリーム情報を取得
+            let stream_info = self.lib.call(
+                "aacDecoder_GetStreamInfo",
+                |f: FnAacDecoderGetStreamInfo| f(h),
+            )?;
+            if stream_info.is_null() {
+                return Ok(None);
+            }
+
+            let stream_info = &*stream_info;
+            if stream_info.frameSize <= 0
+                || stream_info.numChannels <= 0
+                || stream_info.sampleRate <= 0
+            {
+                return Err(Error::InvalidInput(
+                    "aacDecoder_GetStreamInfo returned invalid stream parameters",
+                ));
+            }
+            let frame_size = stream_info.frameSize as usize;
+            let num_channels = u8::try_from(stream_info.numChannels)
+                .map_err(|_| Error::InvalidInput("numChannels exceeds u8 range"))?;
+            let sample_rate = stream_info.sampleRate as u32;
+            let total_samples = frame_size * num_channels as usize;
+
+            // デコード結果がバッファサイズを超える場合はエラーにする。
+            // Decoder は audio_specific_config 経由で任意チャンネル数を受け取りうるため、
+            // C API が返した値がバッファ範囲内であることを検証する必要がある。
+            if total_samples > DECODE_BUF_SIZE {
+                return Err(Error::InvalidInput(
+                    "aacDecoder_DecodeFrame output exceeds decode buffer size",
+                ));
+            }
+
+            // バッファを実際のサンプル数に縮小
+            decode_buf.truncate(total_samples);
+
+            Ok(Some(DecodedFrame {
+                data: decode_buf,
+                samples: frame_size,
+                channels: num_channels,
+                sample_rate,
+            }))
+        }
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        let _ = self
+            .lib
+            .call("aacDecoder_Close", |f: FnAacDecoderClose| unsafe {
+                f(self.handle)
+            });
+    }
+}
+
+// HANDLE_AACDECODER 自体はスレッドセーフではないが、
+// Decoder は &mut self を要求するため、同時アクセスは Rust の型システムで防がれる。
+// Sync は実装しない: HANDLE_AACDECODER が内部的にスレッドセーフでないため。
+unsafe impl Send for Decoder {}
+
+/// デコードされた AAC フレーム
+///
+/// 1 回のデコードで生成される PCM データとメタデータを保持する。
+#[derive(Debug)]
+pub struct DecodedFrame {
+    /// PCM データ（インターリーブ形式）
+    pub data: Vec<i16>,
+
+    /// フレーム内のサンプル数（チャンネル数は含まない）
+    pub samples: usize,
+
+    /// チャンネル数
+    pub channels: u8,
+
+    /// サンプルレート (Hz)
+    pub sample_rate: u32,
+}
+
+impl DecodedFrame {
+    /// フレーム内の総サンプル数 (チャンネル数 * samples)
+    pub fn total_samples(&self) -> usize {
+        self.samples * self.channels as usize
+    }
+}

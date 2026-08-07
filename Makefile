@@ -1,0 +1,40 @@
+.PHONY: test cover pbt fuzz fuzz-list check clippy fmt clean
+
+# 全テストを実行する
+test:
+	cargo test --workspace
+
+# 全テストカバレッジ付きで実行する
+cover:
+	cargo llvm-cov --tests --workspace
+
+# PBT を実行する
+pbt:
+	cargo test -p pbt
+
+# Fuzzing を全ターゲットで 30 秒ずつ実行する
+fuzz:
+	@for target in $$(cargo fuzz list); do \
+		echo "=== Fuzzing $$target ==="; \
+		cargo +nightly fuzz run $$target -- -max_total_time=30 || exit 1; \
+	done
+
+# Fuzzing ターゲット一覧を表示する
+fuzz-list:
+	cargo fuzz list
+
+# cargo check を実行する
+check:
+	cargo check --workspace
+
+# cargo clippy を実行する
+clippy:
+	cargo clippy --workspace -- -D warnings
+
+# cargo fmt を実行する
+fmt:
+	cargo fmt --all
+
+# ビルド成果物を削除する
+clean:
+	cargo clean
