@@ -1,6 +1,9 @@
 # fdk-aac-rs
 
+[![crates.io](https://img.shields.io/crates/v/shiguredo_fdk_aac.svg)](https://crates.io/crates/shiguredo_fdk_aac)
+[![docs.rs](https://docs.rs/shiguredo_fdk_aac/badge.svg)](https://docs.rs/shiguredo_fdk_aac)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![GitHub Actions](https://github.com/shiguredo/fdk-aac-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/shiguredo/fdk-aac-rs/actions/workflows/ci.yml)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/shiguredo)
 
 ## About Shiguredo's open source software
@@ -32,6 +35,8 @@ Please read <https://github.com/shiguredo/oss> before use.
 
 ## 動作要件
 
+- Ubuntu 26.04 x86_64
+- Ubuntu 26.04 arm64
 - Ubuntu 24.04 x86_64
 - Ubuntu 24.04 arm64
 - Ubuntu 22.04 x86_64
@@ -154,7 +159,7 @@ while let Some(frame) = decoder.next_frame()? {
 Apache License 2.0
 
 ```text
-Copyright 2026-2026, Shiguredo Inc.
+Copyright 2026, Shiguredo Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
