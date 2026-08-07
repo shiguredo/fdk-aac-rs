@@ -11,10 +11,13 @@
 
 ## develop
 
+## 2025.2.0
+
+**リリース日**: 2026-08-07
+
 - [CHANGE] 最小サポート Rust バージョン (MSRV) を 1.88 から 1.93 に変更する
   - @voluntas
-- [CHANGE] ビルド時のライブラリリンクを廃止し、実行時に `dlopen`/`dlsym` で動的ロードする方式に変更する
-  - `FdkAacLibrary` を追加し、`Encoder::new()` と `Decoder::new()` の第一引数に `FdkAacLibrary` を渡す形に変更する
+- [CHANGE] `FdkAacLibrary` を追加し、`Encoder::new()` と `Decoder::new()` の第一引数に `FdkAacLibrary` を渡す形に変更する
   - @voluntas
 - [CHANGE] `Encoder` の API を push/pull パターンに変更する
   - `encode()` の戻り値を `Result<Option<EncodedFrame>, Error>` から `Result<(), Error>` に変更する
@@ -38,13 +41,7 @@
   - @voluntas
 - [ADD] AAC デコーダーを追加する
   - @sile
-
-### misc
-
-- テスト構成を shiguredo-rust 規約に合わせて整理する
-  - 単体テストを `tests/test_lib.rs` に移動する
-  - PBT を `pbt/tests/prop_lib.rs` として追加する
-  - Fuzzing ターゲットを `fuzz/` に追加する
+- [ADD] Ubuntu 26.04 (x86_64 / arm64) 対応を追加する
   - @voluntas
 
 ## 2025.1.1

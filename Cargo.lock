@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "shiguredo_fdk_aac"
-version = "2026.1.0-canary.2"
+version = "2026.1.0"
 dependencies = [
  "bindgen",
 ]
